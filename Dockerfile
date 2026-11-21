@@ -14,12 +14,13 @@ COPY buildtools/fetch_sqlglot.py /app/buildtools/fetch_sqlglot.py
 RUN python /app/buildtools/fetch_sqlglot.py /repo
 RUN python -m compileall -q /repo/sqlglot /repo/tests || true
 
-# Build-time dependency map: run the whole suite once under a line tracer.
+# Build-time map: run the whole suite once against a recording copy of sqlglot
+# (line coverage + comparison/and-or facts for silent-mutation proofs).
 COPY tests.json /app/tests.json
 COPY buildtools /app/buildtools
 RUN python /app/buildtools/build_map.py /repo /app/tests.json /app/map.json 4
 
-COPY selector.py rts_report.py /app/
+COPY selector.py silent.py rts_report.py /app/
 RUN chmod -R a+rX /app /repo
 
 CMD ["python", "/app/selector.py"]

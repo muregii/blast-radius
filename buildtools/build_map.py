@@ -3,6 +3,10 @@ dependency map the selector reads.
 
 Usage: python build_map.py <sqlglot_root> <tests.json> <out_map.json> [jobs]
 
+The suite runs against an instrumented copy of sqlglot (instrument.py), so the
+same pass records line coverage and the comparison / and-or facts used to
+prove that an edit is silent for a group.
+
 Groups:
   * every test at or above HEAVY_SECONDS runs alone, so its coverage is exact;
   * the other tests of one test file run together in one process. Inside a
@@ -43,11 +47,16 @@ def main() -> None:
             groups.append({"tests": [t["id"]], "args": [t["id"]]})
 
     tmp = tempfile.mkdtemp(prefix="rtsmap")
+    instr = os.path.join(tmp, "instr")
+    subprocess.run([sys.executable, os.path.join(HERE, "instrument.py"), root, instr], check=True)
+    sites = json.load(open(os.path.join(instr, "rts_sites.json")))
+    run_root = instr
     env = dict(os.environ)
     env.update(
         SKIP_INTEGRATION="0",
-        RTS_ROOT=root,
-        PYTHONPATH=os.pathsep.join([root, HERE]),
+        RTS_RECORD="1",
+        RTS_ROOT=run_root,
+        PYTHONPATH=os.pathsep.join([run_root, HERE]),
         PYTHONDONTWRITEBYTECODE="1",
     )
 
@@ -58,7 +67,7 @@ def main() -> None:
             f.write("\n".join(groups[i]["args"]))
         cmd = [sys.executable, "-m", "pytest", "-q", "-p", "rtsmap_plugin",
                "-p", "no:cacheprovider", "-o", "addopts=", f"@{argfile}"]
-        proc = subprocess.run(cmd, cwd=root, env={**env, "RTS_OUT": out},
+        proc = subprocess.run(cmd, cwd=run_root, env={**env, "RTS_OUT": out},
                               capture_output=True, text=True)
         if not os.path.exists(out):
             sys.stderr.write(proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -75,7 +84,19 @@ def main() -> None:
     lines: dict[str, dict[int, list[int]]] = {}
     opens: dict[str, list[int]] = {}
     failed_baseline: list[str] = []
+    cmp: dict[str, dict[str, list]] = {}
+    vals: dict[str, dict[str, object]] = {}
+    truth: dict[str, dict[str, list]] = {}
+    incomplete: list[int] = []
     for gi, res in enumerate(results):
+        if res.get("incomplete_children"):
+            incomplete.append(gi)
+        for k, v in res.get("cmp", {}).items():
+            cmp.setdefault(k, {})[str(gi)] = v
+        for k, v in res.get("vals", {}).items():
+            vals.setdefault(k, {})[str(gi)] = v
+        for k, v in res.get("truth", {}).items():
+            truth.setdefault(k, {})[str(gi)] = v
         seen: dict[str, set[int]] = {}
         for files in res["lines"].values():
             for f, ls in files.items():
@@ -91,16 +112,26 @@ def main() -> None:
                     lst.append(gi)
         failed_baseline += [n for n, o in res["outcomes"].items() if o == "failed"]
 
+
     out = {
         "groups": [g["tests"] for g in groups],
         "lines": {f: {str(k): v for k, v in per.items()} for f, per in lines.items()},
         "opens": opens,
         "failed_baseline": failed_baseline,
+        "sites": sites,
+        "cmp": cmp,
+        "vals": vals,
+        "truth": truth,
+        "incomplete": incomplete,
     }
     with open(out_path, "w") as f:
         json.dump(out, f, separators=(",", ":"))
+    import shutil
+
+    shutil.rmtree(tmp, ignore_errors=True)
     print(f"map: {len(groups)} groups, {len(lines)} files, "
-          f"{len(opens)} data files, baseline failures {failed_baseline}", file=sys.stderr)
+          f"{len(opens)} data files, {len(cmp)} cmp sites, {len(truth)} bool sites, "
+          f"incomplete groups {incomplete}, baseline failures {failed_baseline}", file=sys.stderr)
 
 
 if __name__ == "__main__":

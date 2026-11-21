@@ -27,6 +27,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from silent import Prover  # noqa: E402
+
 DATA = Path(os.environ.get("RTS_DATA", "/data"))
 REPO = Path(os.environ.get("RTS_REPO", "/repo"))
 MAP = Path(os.environ.get("RTS_MAP", "/app/map.json"))
@@ -244,6 +247,8 @@ class PyIndex:
 class Selector:
     def __init__(self):
         raw = json.loads(MAP.read_text())
+        if raw.get("failed_baseline"):
+            log(f"warning: map baseline failures {raw['failed_baseline']}")
         self.groups: list[list[str]] = raw["groups"]
         self.lines: dict[str, dict[str, list[int]]] = raw["lines"]
         self.opens: dict[str, list[int]] = raw["opens"]
@@ -251,6 +256,8 @@ class Selector:
         self.tests = doc["tests"]
         self.by_id = {t["id"]: t for t in self.tests}
         self.ms = {t["number"]: round(t["seconds"] * 1000) for t in self.tests}
+        self.prover = Prover(raw)
+        self.silent_log: list[str] = []
         mapped = {i for g in self.groups for i in g}
         # Tests the map does not know about are always selected.
         self.unmapped = {t["number"] for t in self.tests if t["id"] not in mapped}
@@ -332,30 +339,48 @@ class Selector:
                 return set(self.all), "shared test helper"
             return {t["number"] for t in self.tests if t["file"] == mod}, "test file"
 
-        lines: set[int] = set()
+        all_gis: set[int] = set()
+        notes = []
         for start, body in fp.hunks:
             # Ignore hunks that on their own leave the AST unchanged.
             try:
-                if ast_equal(old_text, apply_hunks(old_text, [(start, body)])):
-                    continue
+                hunk_text = apply_hunks(old_text, [(start, body)])
             except ValueError:
-                pass
+                return set(self.all), "hunk does not apply alone"
+            if ast_equal(old_text, hunk_text):
+                continue
+            lines: set[int] = set()
             removed, near = hunk_regions(start, body)
+            whole_file = False
             for ln in removed:
                 span = index.stmt_lines(ln)
                 if span is None:
-                    return self.group_tests(self.groups_for_file(path)), "line outside statements"
+                    whole_file = True
+                    break
                 lines |= span
-            if near:
+            if near and not whole_file:
                 # Inserted code runs only if its enclosing function runs; at
                 # module or class level it runs at import.
                 for ln in near:
                     span = index.enclosing_function_lines(ln) if ln >= 1 else None
                     if span is None:
-                        return self.group_tests(self.groups_for_file(path)), "module-level insertion"
+                        whole_file = True
+                        break
                     lines |= span
-        gis = self.groups_for_lines(path, lines)
-        return self.group_tests(gis), f"{len(lines)} lines"
+            gis = self.groups_for_file(path) if whole_file else self.groups_for_lines(path, lines)
+            # Silent-mutation proof: drop groups whose recorded executions
+            # cannot tell the old expression from the new one.
+            if gis and not near:
+                try:
+                    silent, why = self.prover.prove(path, index.tree, ast.parse(hunk_text), gis)
+                except Exception as e:  # never let the prover cost safety
+                    silent, why = set(), f"prover error {e!r}"
+                if silent:
+                    gis = gis - silent
+                notes.append(why)
+                self.silent_log.append(f"{path}: {why}")
+            all_gis |= gis
+        return self.group_tests(all_gis), "; ".join(notes) or "lines"
 
 
 # ----------------------------------------------------------- verification --

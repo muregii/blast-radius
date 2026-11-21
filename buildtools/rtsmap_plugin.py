@@ -116,21 +116,64 @@ def pytest_sessionfinish(session, exitstatus):
     except Exception:
         pass
     time.sleep(0.2)
+    import builtins
+
+    cmp: dict[str, set] = {}
+    vals: dict[str, object] = {}
+    truth: dict[str, set] = {}
+
+    def add_record(c, v, t):
+        for k, facts in c.items():
+            cmp.setdefault(str(k), set()).update(
+                tuple(f) if isinstance(f, list) else f for f in facts)
+        for k, pairs in v.items():
+            k = str(k)
+            if pairs == "overflow" or vals.get(k) == "overflow":
+                vals[k] = "overflow"
+                continue
+            cur = vals.setdefault(k, set())
+            cur.update(json.dumps(p) for p in pairs)
+        for k, facts in t.items():
+            truth.setdefault(str(k), set()).update(tuple(f) for f in facts)
+
+    rec = getattr(builtins, "_rts_data", None)
+    if rec is not None:
+        import sitecustomize as _sc
+
+        cf, cv, tf = rec
+        add_record(
+            {k: [list(f) if f != "X" else "X" for f in s] for k, s in cf.items()},
+            {k: _sc._encode_values(s) for k, s in cv.items()},
+            {k: list(s) for k, s in tf.items()},
+        )
+
     children = 0
+    started = {n[:-6] for n in os.listdir(_CHILD_DIR) if n.endswith(".start")}
+    finished = set()
     for name in os.listdir(_CHILD_DIR):
+        if not name.endswith(".json"):
+            continue
         try:
             with open(os.path.join(_CHILD_DIR, name)) as f:
                 child = json.load(f)
         except Exception:
             continue
+        finished.add(name[:-5])
         children += 1
-        for rel, ls in child.items():
+        for rel, ls in child.get("lines", {}).items():
             _lines[""].setdefault(rel, set()).update(ls)
+        add_record(child.get("cmp", {}), child.get("vals", {}), child.get("truth", {}))
     _outcomes["__children__"] = str(children)
+    incomplete = sorted(started - finished)
     data = {
         "lines": {ctx: {f: sorted(ls) for f, ls in files.items()} for ctx, files in _lines.items()},
         "opens": {ctx: sorted(p) for ctx, p in _opens.items()},
         "outcomes": _outcomes,
+        "incomplete_children": incomplete,
+        "cmp": {k: sorted((list(f) if f != "X" else "X" for f in s), key=repr) for k, s in cmp.items()},
+        "vals": {k: (v if v == "overflow" else [json.loads(x) for x in sorted(v)])
+                 for k, v in vals.items()},
+        "truth": {k: sorted((list(f) for f in s), key=repr) for k, s in truth.items()},
     }
     with open(_OUT, "w") as f:
         json.dump(data, f)
