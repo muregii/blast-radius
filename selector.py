@@ -288,6 +288,7 @@ class Selector:
         for a, sid in raw.get("attrs", {}).items():
             self.attr_tests[a] = self.group_tests_cached(sets[sid]) if sets is not None else set()
         self._state = None
+        self._attr_tree: PatchedTree | None = None
         self._test_texts: dict[str, str] = {}
         self._helpers = None
         self._test_blob = None
@@ -461,7 +462,9 @@ class Selector:
             return None, "no attribute map"
         try:
             base = self._base_state()
-            root = mirror_tree(TMP / "st", new_texts)
+            if self._attr_tree is None:
+                self._attr_tree = PatchedTree(TMP / "st", with_tests=False)
+            root = self._attr_tree.apply(new_texts)
             out = TMP / "rts_state.json"
             if out.exists():
                 out.unlink()
@@ -744,119 +747,109 @@ def _bodies_ok(old: list, new: list, in_class: bool) -> bool:
     return True
 
 
-def mirror_tree(root: Path, new_texts: dict[str, str]) -> Path:
-    """root/sqlglot: symlinks to the pinned sqlglot with the patched modules as
-    real files."""
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
-    changed = {Path(p): t for p, t in new_texts.items() if p.startswith("sqlglot/")}
-    on_path = {Path(*p.parts[:i]) for p in changed for i in range(1, len(p.parts))}
-
-    def fill(rel: Path):
-        (root / rel).mkdir()
-        for entry in os.scandir(REPO / rel):
-            r = rel / entry.name
-            if r in changed:
-                continue
-            if r in on_path:
-                fill(r)
-            else:
-                (root / r).symlink_to(REPO / r)
-
-    fill(Path("sqlglot"))
-    for r, text in changed.items():
-        (root / r).write_text(text, encoding="utf-8")
-    return root
-
-
 # ----------------------------------------------------------- verification --
 
-class Workspace:
-    """/tmp/w holds a real copy of tests/ (pytest must see real paths to match
-    node ids) and, per commit, a symlink mirror of sqlglot/ with the changed
-    modules written as real files."""
+class PatchedTree:
+    """A directory laid out like the pinned repo with the patch's files in
+    place, and a way to run tests in it.
 
-    def __init__(self, root: Path):
+    root/sqlglot is a symlink to the pinned package or, when the patch changes
+    modules in it, a tree of symlinks with the changed modules as real files.
+    With `with_tests`, root/tests is a real copy of the pinned tests/ (pytest
+    resolves symlinks and then cannot match node ids) and changed test files
+    are written into it. Without it, test edits are ignored: the tree is only
+    good for importing sqlglot.
+
+    apply() undoes the previous apply() first, so one tree serves many
+    commits; apply({}) gives the pinned code.
+    """
+
+    def __init__(self, root: Path, repo: Path | None = None, with_tests: bool = True):
         self.root = root
+        self.repo = repo if repo is not None else REPO
+        self.with_tests = with_tests
         if root.exists():
             shutil.rmtree(root)
         root.mkdir(parents=True)
-        shutil.copytree(REPO / "tests", root / "tests", symlinks=False)
-        self.restore: dict[Path, bytes] = {}
+        if with_tests:
+            shutil.copytree(self.repo / "tests", root / "tests", symlinks=False)
+        self._restore: dict[Path, bytes] = {}
 
-    def prepare(self, new_texts: dict[str, str]) -> None:
-        for path, data in self.restore.items():
+    def apply(self, new_texts: dict[str, str]) -> Path:
+        for path, data in self._restore.items():
             path.write_bytes(data)
-        self.restore.clear()
+        self._restore.clear()
         pkg = self.root / "sqlglot"
-        if pkg.exists() or pkg.is_symlink():
-            if pkg.is_symlink():
-                pkg.unlink()
-            else:
-                shutil.rmtree(pkg)
+        if pkg.is_symlink():
+            pkg.unlink()
+        elif pkg.exists():
+            shutil.rmtree(pkg)
         src_changes = {Path(p): t for p, t in new_texts.items() if p.startswith("sqlglot/")}
         if not src_changes:
-            pkg.symlink_to(REPO / "sqlglot")
+            pkg.symlink_to(self.repo / "sqlglot")
         else:
-            changed = set(src_changes)
-            on_path = {Path(*p.parts[:i]) for p in changed for i in range(1, len(p.parts))}
+            on_path = {Path(*p.parts[:i]) for p in src_changes for i in range(1, len(p.parts))}
 
             def fill(rel: Path):
                 (self.root / rel).mkdir()
-                for entry in os.scandir(REPO / rel):
+                for entry in os.scandir(self.repo / rel):
                     r = rel / entry.name
-                    if r in changed:
+                    if r in src_changes:
                         continue
                     if r in on_path:
                         fill(r)
                     else:
-                        (self.root / r).symlink_to(REPO / r)
+                        (self.root / r).symlink_to(self.repo / r)
 
             fill(Path("sqlglot"))
             for r, text in src_changes.items():
                 (self.root / r).write_text(text, encoding="utf-8")
-        for p, text in new_texts.items():
-            if p.startswith("tests/"):
-                target = self.root / p
-                self.restore[target] = target.read_bytes()
-                target.write_text(text, encoding="utf-8")
+        if self.with_tests:
+            for p, text in new_texts.items():
+                if p.startswith("tests/"):
+                    target = self.root / p
+                    self._restore[target] = target.read_bytes()
+                    target.write_text(text, encoding="utf-8")
+        return self.root
 
-
-def run_tests(tree: Path, ids: list[str], timeout: float) -> tuple[set[str] | None, str]:
-    """Run ids in tree. Returns the failed ids, or None if the run was unusable."""
-    report = TMP / "rts_report.json"
-    argfile = TMP / "rts_args.txt"
-    if report.exists():
-        report.unlink()
-    argfile.write_text("\n".join(ids))
-    env = dict(os.environ)
-    env.update(
-        SKIP_INTEGRATION="0",
-        PYTHONPATH=os.pathsep.join([str(tree), str(APP)]),
-        PYTHONDONTWRITEBYTECODE="1",
-        RTS_REPORT=str(report),
-    )
-    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "rts_report",
-           "-p", "no:cacheprovider", "-o", "addopts=", "--rootdir", str(tree),
-           "-W", "ignore", f"@{argfile}"]
-    try:
-        proc = subprocess.run(cmd, cwd=tree, env=env, capture_output=True, text=True,
-                              timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, "timeout"
-    if not report.exists():
-        return None, f"no report (rc={proc.returncode}) {proc.stderr[-500:]}"
-    res = json.loads(report.read_text())
-    outcomes = res["outcomes"]
-    failed = {i for i in ids if outcomes.get(i) == "failed"}
-    broken = set(res["broken_files"])
-    failed |= {i for i in ids if i.split("::")[0] in broken}
-    missing = [i for i in ids if i not in outcomes and i.split("::")[0] not in broken]
-    if missing:
-        # A test we asked for never reported: treat it as failing.
-        failed |= set(missing)
-    return failed, f"rc={proc.returncode}"
+    def run(self, ids: list[str], timeout: float) -> tuple[set[str] | None, str]:
+        """Run ids in the tree. Returns the failed ids, or None if the run
+        was unusable. A test that never reports counts as failed."""
+        if not self.with_tests:
+            raise ValueError("tree has no tests/")
+        tree = self.root
+        report = tree.parent / f"{tree.name}_report.json"
+        argfile = tree.parent / f"{tree.name}_args.txt"
+        if report.exists():
+            report.unlink()
+        argfile.write_text("\n".join(ids))
+        env = dict(os.environ)
+        env.update(
+            SKIP_INTEGRATION="0",
+            PYTHONPATH=os.pathsep.join([str(tree), str(APP)]),
+            PYTHONDONTWRITEBYTECODE="1",
+            RTS_REPORT=str(report),
+        )
+        cmd = [sys.executable, "-m", "pytest", "-q", "-p", "rts_report",
+               "-p", "no:cacheprovider", "-o", "addopts=", "--rootdir", str(tree),
+               "-W", "ignore", f"@{argfile}"]
+        try:
+            proc = subprocess.run(cmd, cwd=tree, env=env, capture_output=True, text=True,
+                                  timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, "timeout"
+        if not report.exists():
+            return None, f"no report (rc={proc.returncode}) {proc.stderr[-500:]}"
+        res = json.loads(report.read_text())
+        outcomes = res["outcomes"]
+        failed = {i for i in ids if outcomes.get(i) == "failed"}
+        broken = set(res["broken_files"])
+        failed |= {i for i in ids if i.split("::")[0] in broken}
+        missing = [i for i in ids if i not in outcomes and i.split("::")[0] not in broken]
+        if missing:
+            # A test we asked for never reported: treat it as failing.
+            failed |= set(missing)
+        return failed, f"rc={proc.returncode}"
 
 
 # ------------------------------------------------------------------ split --
@@ -918,11 +911,11 @@ def main() -> None:
                 and est_cpu * 1.5 < allowance):
             try:
                 if ws is None:
-                    ws = Workspace(TMP / "w")
-                ws.prepare(new_texts)
+                    ws = PatchedTree(TMP / "w")
+                ws.apply(new_texts)
                 ids = [sel.tests[n]["id"] for n in cheap]
                 timeout = min(allowance, 3 * est_cpu + 5)
-                failed, info = run_tests(ws.root, ids, timeout=timeout)
+                failed, info = ws.run(ids, timeout=timeout)
             except Exception as e:
                 failed, info = None, f"error {e!r}"
             if failed is not None:

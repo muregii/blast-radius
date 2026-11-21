@@ -70,7 +70,7 @@ def main():
     recorded = [i for i in range(len(sites))
                 if str(i) in raw["cmp"] or str(i) in raw["truth"]]
     rng.shuffle(recorded)
-    ws = S.Workspace(S.TMP / "w")
+    ws = S.PatchedTree(S.TMP / "w")
     tested = claims = bugs = 0
     t0 = time.time()
     for idx in recorded:
@@ -118,14 +118,14 @@ def main():
                     break
                 keep.append(i)
             ids = keep
-        ws.prepare(new_texts)
-        failed, info = S.run_tests(ws.root, ids, timeout=600)
+        ws.apply(new_texts)
+        failed, info = ws.run(ids, timeout=600)
         if failed:
             # Some tests depend on run order (they fail on clean code too when
             # run after certain others). Only failures the clean code does not
             # reproduce in the same order count.
-            ws.prepare({})
-            clean, _ = S.run_tests(ws.root, ids, timeout=600)
+            ws.apply({})
+            clean, _ = ws.run(ids, timeout=600)
             if clean:
                 failed = set(failed) - set(clean)
         status = "OK"

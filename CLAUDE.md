@@ -69,8 +69,10 @@ Decision time (`selector.py`, `silent.py`), per patch:
 - A changed PEP 263 `coding:` line → everything that imports the file.
 - Anything unanalysable → all tests.
 - Split: LPT over k=1..8 workers, choose min(busiest + 2 s·k).
-- Running candidates to check them exists (`run_tests`, `Workspace`) but the
-  cost rule nearly always prefers printing.
+- Running candidates to check them exists (`PatchedTree.run`) but the
+  cost rule nearly always prefers printing. `PatchedTree` (see CONTEXT.md)
+  also builds the class-attribute path's import tree; the stress scripts use
+  the same `apply` / `run` pair.
 
 ## Where the remaining cost is
 Per-test coverage (v3) fixed fixture edits (151 → 1 test). What remains:
@@ -90,7 +92,7 @@ Per-test coverage (v3) fixed fixture edits (151 → 1 test). What remains:
   them). Map key `attrs`: `owner|name` → test set.
 - Decide: only for edits whose changed statements are all class-body plain
   assignments (`class_body_data_edit`) and whose line-based cost is above
-  5 s. Runs importstate on a symlink mirror with the patched files, diffs
+  5 s. Runs importstate on a patched tree (no tests/), diffs
   against the build state. Falls back to the line rule on: import failure,
   any `M:` change, an added/removed key, an unrecorded name, an enum value.
   Otherwise selects readers of each changed key ∪ tests whose files name the
@@ -145,7 +147,7 @@ Per-test coverage (v3) fixed fixture edits (151 → 1 test). What remains:
 - multiprocessing's resource tracker never runs sqlglot; children register
   for completeness only on their first sqlglot line.
 - pytest resolves symlinked test dirs and then can't match node ids: the
-  verification workspace keeps a real copy of `tests/` in /tmp (64 MB limit).
+  patched tree keeps a real copy of `tests/` in /tmp (64 MB limit).
 - The recording copy must include the whole repo (`sqlglotc/` etc.), not just
   `sqlglot/` and `tests/`.
 - Rules forbid tables from patch/kind-of-edit → failing tests. Facts about the

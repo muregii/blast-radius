@@ -47,7 +47,7 @@ def main():
     rng = random.Random(seed)
     sel = S.Selector()
     files = sorted({t["file"] for t in sel.tests})
-    ws = S.Workspace(S.TMP / "w")
+    ws = S.PatchedTree(S.TMP / "w")
     tested = bugs = 0
     t0 = time.time()
     tries = 0
@@ -85,11 +85,11 @@ def main():
                 continue
             acc += sel.tests[i]["seconds"]
             ids.append(sel.tests[i]["id"])
-        ws.prepare(new_texts)
-        failed, info = S.run_tests(ws.root, ids, timeout=900)
+        ws.apply(new_texts)
+        failed, info = ws.run(ids, timeout=900)
         if failed:
-            ws.prepare({})
-            clean, _ = S.run_tests(ws.root, ids, timeout=900)
+            ws.apply({})
+            clean, _ = ws.run(ids, timeout=900)
             if clean:
                 failed = set(failed) - set(clean)
         status = "OK"
