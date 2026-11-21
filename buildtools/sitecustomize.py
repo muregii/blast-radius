@@ -160,6 +160,113 @@ if os.environ.get("RTS_RECORD") == "1":
     builtins._rts_c = _rts_c
     builtins._rts_v = _rts_v
 
+    # ---- class attribute reads -------------------------------------------
+    # Each read of an instrumented class attribute records the class that
+    # holds the value ("module.qualname|NAME"), found the way Python finds it.
+    # Reads made while a sqlglot module is being imported (class bodies,
+    # metaclasses, __init_subclass__) are not recorded: their effects are
+    # class/module state, which importstate.py compares before and after a
+    # patch.
+    attr_reads: set = set()
+    builtins._rts_attrs = attr_reads
+    _import_depth = [0]
+    _owner_cache: dict = {}
+    _getattr = getattr
+    _hasattr = hasattr
+
+    import importlib._bootstrap_external as _ibe
+
+    _orig_exec = _ibe._LoaderBasics.exec_module
+
+    def _exec_module(self, module, _orig=_orig_exec):
+        name = getattr(module, "__name__", "")
+        if name == "sqlglot" or name.startswith("sqlglot."):
+            _import_depth[0] += 1
+            try:
+                return _orig(self, module)
+            finally:
+                _import_depth[0] -= 1
+        return _orig(self, module)
+
+    _ibe._LoaderBasics.exec_module = _exec_module
+
+    def _owner_key(obj, name):
+        if isinstance(obj, type):
+            ck = (obj, name)
+            k = _owner_cache.get(ck, 0)
+            if k == 0:
+                k = None
+                for c in obj.__mro__:
+                    if name in c.__dict__:
+                        k = f"{c.__module__}.{c.__qualname__}|{name}"
+                        break
+                else:
+                    for c in type(obj).__mro__:
+                        if name in c.__dict__:
+                            k = f"{c.__module__}.{c.__qualname__}|{name}"
+                            break
+                _owner_cache[ck] = k
+            return k
+        if isinstance(obj, super):
+            try:
+                mro = obj.__self_class__.__mro__
+                start = mro.index(obj.__thisclass__) + 1
+            except Exception:
+                return None
+            for c in mro[start:]:
+                if name in c.__dict__:
+                    return f"{c.__module__}.{c.__qualname__}|{name}"
+            return None
+        d = _getattr(obj, "__dict__", None)
+        if type(d) is dict and name in d:
+            return None  # instance attribute
+        t = type(obj)
+        ck = (t, name)
+        k = _owner_cache.get(ck, 0)
+        if k == 0:
+            k = None
+            for c in t.__mro__:
+                if name in c.__dict__:
+                    k = f"{c.__module__}.{c.__qualname__}|{name}"
+                    break
+            _owner_cache[ck] = k
+        return k
+
+    def _note_attr(obj, name):
+        if _import_depth[0]:
+            return
+        try:
+            k = _owner_key(obj, name)
+        except Exception:
+            return
+        if k is not None and k.startswith("sqlglot"):
+            attr_reads.add(k)
+
+    def _rts_a(obj, name):
+        v = _getattr(obj, name)
+        _note_attr(obj, name)
+        return v
+
+    def _rts_getattr(obj, name, *default):
+        try:
+            v = _getattr(obj, name)
+        except AttributeError:
+            if default:
+                return default[0]
+            raise
+        _note_attr(obj, name)
+        return v
+
+    def _rts_hasattr(obj, name):
+        r = _hasattr(obj, name)
+        if r:
+            _note_attr(obj, name)
+        return r
+
+    builtins._rts_a = _rts_a
+    builtins._rts_getattr = _rts_getattr
+    builtins._rts_hasattr = _rts_hasattr
+
 
 def _encode_values(vals):
     if vals == "overflow":
@@ -218,6 +325,9 @@ if _is_child:
                 data["cmp"] = {str(k): [list(f) if f != "X" else "X" for f in v] for k, v in cf.items()}
                 data["vals"] = {str(k): _encode_values(v) for k, v in cv.items()}
                 data["truth"] = {str(k): sorted(v, key=repr) for k, v in tf.items()}
+            ar = getattr(builtins, "_rts_attrs", None)
+            if ar is not None:
+                data["attrs"] = sorted(ar)
             path = os.path.join(_dir, f"{os.getpid()}.json")
             with open(path + ".tmp", "w") as f:
                 json.dump(data, f)

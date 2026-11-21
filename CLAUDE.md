@@ -18,7 +18,8 @@ A single miss costs more than the whole leader's total, so **zero misses comes f
 | starter | e60dec6 | — | 1614.1 s |
 | v1 coverage | 08354ee | 268.2 s, 0 misses | 327.4 s, 0 misses |
 | v2 silent proofs | 4fe3624 | 212.5 s, 0 misses | **317.0 s, 0 misses** (CPU ≈ 2.2 s) |
-| v3 per-test coverage | see RESULTS.md | 168.8 s, 0 misses | see RESULTS.md |
+| v3 per-test coverage | 0f7a851 | 168.8 s, 0 misses | not submitted (c2 superseded it) |
+| c2 class-attribute reads | see RESULTS.md | 127.7 s, 0 misses | see RESULTS.md |
 
 Every submission and what it taught is logged in RESULTS.md.
 
@@ -61,12 +62,28 @@ Decision time (`selector.py`, `silent.py`), per patch:
 
 ## Where the remaining cost is
 Per-test coverage (v3) fixed fixture edits (151 → 1 test). What remains:
-- Class-level constant edits (`arg_types`, dialect settings like
-  `WEEK_OFFSET`, `NUMERIC_ESCAPES`) run at import, so they select every test
-  of every chunk that imported the module (ktz3: all 1617 tests).
-  Idea: record per test which (defining class, attribute) pairs it read.
+- Class-level constant edits: handled by c2 (below) when the edit only
+  changes class-body data assignments. ktz3 went 1617 → 36 tests.
 - Heavy tests dominate: `test_max_nodes` 28.8 s, tpcds/tpch executor tests.
   Any edit on a line they run costs ≥ 30 s unless proven silent.
+
+## Class-attribute path (c2)
+- Build: `buildtools/importstate.py` imports every `sqlglot.*` module and
+  fingerprints every module global (`M:`) and reachable class attribute
+  (`C:module.qualname|attr`) → `/app/map.state.json`. Its data attribute
+  names go to `instrument.py`, which rewrites loads of those names to
+  `_rts_a(obj, "NAME")` (and constant-name `getattr`/`hasattr`). The
+  recorder keys each read by the defining class in the MRO; reads made while
+  a sqlglot module is being imported are skipped (the state diff covers
+  them). Map key `attrs`: `owner|name` → test set.
+- Decide: only for edits whose changed statements are all class-body plain
+  assignments (`class_body_data_edit`) and whose line-based cost is above
+  5 s. Runs importstate on a symlink mirror with the patched files, diffs
+  against the build state. Falls back to the line rule on: import failure,
+  any `M:` change, an added/removed key, an unrecorded name, an enum value.
+  Otherwise selects readers of each changed key ∪ tests whose files name the
+  attribute ∪ unmapped tests.
+- Soundness: `devtools/stress_attrs.py <n> <seed>` mutates class-body literals.
 
 ## Validating changes (do this before every submission)
 1. Dev env (no Docker needed): Python 3.13, `pip install -r requirements.lock`,
@@ -85,6 +102,17 @@ Per-test coverage (v3) fixed fixture edits (151 → 1 test). What remains:
    docker run flags from the Makefile (don't commit Dockerfile.native).
 
 ## Pitfalls already hit
+- An and/or swap with equal truth values is NOT silent if the swapped
+  operator short-circuits past operands with effects: `not fb and (atom :=
+  self._parse_atom()) is not None` → `or` skips the call and the binding
+  (stress seed 23, parser.py:6774, 44 tests). The prover now requires the
+  skipped operands to be effect-free (names, constants, attributes, `not`,
+  `is`). Present since v2.
+- Some tests depend on run order: `test_dialect::test_enum`,
+  `test_starrocks::test_time_slice_origin_roundtrip` and three
+  `test_sqlglotc` tests fail on clean code when ~1600 tests run in one
+  process sorted by duration. The stress scripts now rerun the same ids on
+  clean code and only count failures the clean run doesn't reproduce.
 - Recorder dedup of scalar pairs must include `a is b`: equal strings/ints
   are not always the same object. Without it, `==`→`is` was "proven" silent
   and a test failed (stress seed 7, spark2.py:307). Present in v1/v2 too.

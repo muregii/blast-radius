@@ -103,6 +103,7 @@ def _harvest(child_dir: str):
     Returns (lines, cmp, vals, truth, n_children, incomplete_pids)."""
     lines: dict[str, set[int]] = {}
     recs = []
+    attrs: set[str] = set()
     started = {n[:-6] for n in os.listdir(child_dir) if n.endswith(".start")}
     finished = set()
     for name in os.listdir(child_dir):
@@ -117,7 +118,8 @@ def _harvest(child_dir: str):
         for rel, ls in child.get("lines", {}).items():
             lines.setdefault(rel, set()).update(ls)
         recs.append((child.get("cmp", {}), child.get("vals", {}), child.get("truth", {})))
-    return lines, recs, len(finished), sorted(started - finished)
+        attrs.update(child.get("attrs", ()))
+    return lines, recs, len(finished), sorted(started - finished), attrs
 
 
 def _own_record():
@@ -147,13 +149,16 @@ def _child_run(item, out: str) -> None:
     d = tempfile.mkdtemp(prefix="t", dir=_CHILD_DIR)
     os.environ["RTS_CHILD_DIR"] = d
     os.environ["RTS_PARENT_PID"] = str(os.getpid())
+    own_attrs = getattr(__import__("builtins"), "_rts_attrs", None)
+    if own_attrs is not None:
+        own_attrs.clear()  # reads before the fork are the chunk's
     _mon.restart_events()
     reports = runtestprotocol(item, log=False, nextitem=None)
     for r in reports:
         pytest_runtest_logreport(r)
     _wait_pools()
     _mon.set_events(_TOOL, 0)
-    plines, precs, nchild, incomplete = _harvest(d)
+    plines, precs, nchild, incomplete, pattrs = _harvest(d)
     for rel, ls in plines.items():
         _lines[_current].setdefault(rel, set()).update(ls)
     cmp, vals, truth = _own_record()
@@ -165,6 +170,7 @@ def _child_run(item, out: str) -> None:
         "incomplete": incomplete,
         "own": [cmp, vals, truth],
         "pool": precs,
+        "attrs": sorted(set(own_attrs or ()) | pattrs),
     }
     with open(out + ".tmp", "w") as f:
         json.dump(data, f)
@@ -284,6 +290,8 @@ def pytest_sessionfinish(session, exitstatus):
         )
 
     children = 0
+    # Attribute reads outside any test (collection): every test of the chunk.
+    parent_attrs = set(getattr(builtins, "_rts_attrs", ()) or ())
     started = {n[:-6] for n in os.listdir(_CHILD_DIR) if n.endswith(".start")}
     finished = set()
     for name in os.listdir(_CHILD_DIR):
@@ -299,6 +307,7 @@ def pytest_sessionfinish(session, exitstatus):
         for rel, ls in child.get("lines", {}).items():
             _lines[""].setdefault(rel, set()).update(ls)
         add_record(child.get("cmp", {}), child.get("vals", {}), child.get("truth", {}))
+        parent_attrs.update(child.get("attrs", ()))
     _outcomes["__children__"] = str(children)
     incomplete = sorted(started - finished)
     data = {
@@ -311,6 +320,7 @@ def pytest_sessionfinish(session, exitstatus):
                  for k, v in vals.items()},
         "truth": {k: sorted((list(f) for f in s), key=repr) for k, s in truth.items()},
         "per_test": _per_test,
+        "attrs": sorted(parent_attrs),
     }
     with open(_OUT, "w") as f:
         json.dump(data, f)

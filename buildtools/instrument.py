@@ -29,9 +29,33 @@ def site_key(rel: str, node: ast.AST, kind: str) -> str:
 
 
 class Instrument(ast.NodeTransformer):
-    def __init__(self, rel: str, sites: list[str]):
+    def __init__(self, rel: str, sites: list[str], attr_names: frozenset = frozenset()):
         self.rel = rel
         self.sites = sites
+        # Class attributes whose reads are recorded: `x.NAME` becomes
+        # `_rts_a(x, "NAME")`, and getattr/hasattr with a constant NAME go
+        # through _rts_getattr/_rts_hasattr.
+        self.attr_names = attr_names
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load) and node.attr in self.attr_names:
+            call = ast.Call(
+                func=ast.Name(id="_rts_a", ctx=ast.Load()),
+                args=[node.value, ast.Constant(node.attr)],
+                keywords=[],
+            )
+            return ast.copy_location(call, node)
+        return node
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        f = node.func
+        if (isinstance(f, ast.Name) and f.id in ("getattr", "hasattr") and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value in self.attr_names
+                and not node.keywords):
+            node.func = ast.copy_location(ast.Name(id=f"_rts_{f.id}", ctx=ast.Load()), f)
+        return node
 
     def _site(self, node: ast.AST, kind: str) -> int:
         self.sites.append(site_key(self.rel, node, kind))
@@ -95,6 +119,10 @@ class Instrument(ast.NodeTransformer):
 
 def main() -> None:
     repo, dest = sys.argv[1], sys.argv[2]
+    attr_names: frozenset = frozenset()
+    if len(sys.argv) > 3:
+        with open(sys.argv[3]) as f:
+            attr_names = frozenset(json.load(f))
     if os.path.exists(dest):
         shutil.rmtree(dest)
     # Everything except sqlglot/ is copied as is (tests, sqlglotc/, setup
@@ -119,7 +147,7 @@ def main() -> None:
                 continue
             text = open(src, encoding="utf-8").read()
             tree = ast.parse(text, filename=rel)
-            tree = Instrument(rel, sites).visit(tree)
+            tree = Instrument(rel, sites, attr_names).visit(tree)
             ast.fix_missing_locations(tree)
             # The source file is copied unchanged and the instrumented code
             # goes into an unchecked hash-based .pyc next to it. Python loads

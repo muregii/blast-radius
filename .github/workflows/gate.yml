@@ -1,0 +1,28 @@
+# Pre-submission gate on scorer-like hardware: native linux/amd64, 4 cores.
+# Builds the real Dockerfile (the scorer allows 10 minutes for the build),
+# then runs the image once on the sample under the scorer's run limits.
+name: gate
+on:
+  workflow_dispatch:
+  push:
+    branches: ["gate/**"]
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner
+        run: nproc; free -g
+      - name: Build (timed)
+        run: |
+          start=$(date +%s)
+          docker build --progress=plain --platform linux/amd64 --tag blast-radius-entry . 2>&1 | tee build.log | grep -E "map:|instrumented|ERROR" || true
+          end=$(date +%s)
+          echo "BUILD_SECONDS=$((end - start))"
+          grep -q "incomplete groups \[\], baseline failures \[\]" build.log
+      - name: Sample run (scorer limits)
+        run: |
+          start=$(date +%s)
+          make sample IMAGE=blast-radius-entry 2>&1 | tail -4
+          echo "RUN_SECONDS=$(( $(date +%s) - start ))"

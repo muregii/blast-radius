@@ -271,6 +271,12 @@ class Prover:
             return set(), "and/or operands changed"
         if not in_boolean_context(old_tree, prefix):
             return set(), "and/or value used beyond its truth"
+        # When every operand had the same truth value, the swapped operator
+        # stops after the first operand: the others are no longer evaluated.
+        # That is only silent if evaluating them had no effect (no calls, no
+        # walrus bindings, no user __eq__ / __getitem__ ...).
+        if not all(_effect_free(v) for v in o.values[1:]):
+            return set(), "and/or swap skips operands with effects"
         idx = self.site_index.get(site_key(rel, o, "b"))
         if idx is None:
             return set(), "site not recorded"
@@ -290,6 +296,23 @@ class Prover:
             if all(seen.get(i) == {need} for i in range(len(o.values))):
                 proven.add(g)
         return proven, f"and/or swap, {len(proven)}/{len(groups)} groups silent"
+
+
+def _effect_free(node) -> bool:
+    """True if evaluating `node` cannot run code or bind names, beyond
+    attribute loads and truth tests (whose recorded facts the prover checks)."""
+    if isinstance(node, (ast.Name, ast.Constant)):
+        return isinstance(node, ast.Constant) or isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.Attribute):
+        return _effect_free(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _effect_free(node.operand)
+    if isinstance(node, ast.BoolOp):
+        return all(_effect_free(v) for v in node.values)
+    if isinstance(node, ast.Compare):
+        return all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops) and all(
+            _effect_free(v) for v in [node.left, *node.comparators])
+    return False
 
 
 def _fact(f):

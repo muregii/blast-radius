@@ -25,6 +25,25 @@ CHUNK_SECONDS = 6.0
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+NOT_DATA = ("fn", "classmethod", "staticmethod", "property", "builtin", "class", "method", "enum")
+
+
+def attr_names_from_state(state: dict) -> set[str]:
+    """Names of class attributes holding data (not functions, classes or enum
+    members): reads of these are recorded per test."""
+    names = set()
+    for k, v in state.items():
+        if not k.startswith("C:"):
+            continue
+        name = k.split("|", 1)[1]
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        kind = v.split(":", 1)[0].split("#", 1)[0]
+        if kind not in NOT_DATA:
+            names.add(name)
+    return names
+
+
 def main() -> None:
     root, tests_json, out_path = sys.argv[1:4]
     jobs = int(sys.argv[4]) if len(sys.argv) > 4 else os.cpu_count() or 2
@@ -60,7 +79,20 @@ def main() -> None:
 
     tmp = tempfile.mkdtemp(prefix="rtsmap")
     instr = os.path.join(tmp, "instr")
-    subprocess.run([sys.executable, os.path.join(HERE, "instrument.py"), root, instr], check=True)
+    # Import-time state of the pinned commit (see importstate.py). The
+    # selector compares a patched tree against it.
+    state_path = os.path.splitext(os.path.abspath(out_path))[0] + ".state.json"
+    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("RTS_")}
+    subprocess.run([sys.executable, os.path.join(HERE, "importstate.py"), state_path, root],
+                   check=True, env={**clean_env, "PYTHONHASHSEED": "0", "PYTHONPATH": root,
+                                    "PYTHONDONTWRITEBYTECODE": "1"}, cwd=tmp)
+    state = json.load(open(state_path))["state"]
+    attr_names = sorted(attr_names_from_state(state))
+    names_path = os.path.join(tmp, "attr_names.json")
+    with open(names_path, "w") as f:
+        json.dump(attr_names, f)
+    subprocess.run([sys.executable, os.path.join(HERE, "instrument.py"), root, instr, names_path],
+                   check=True)
     sites = json.load(open(os.path.join(instr, "rts_sites.json")))
     run_root = instr
     env = dict(os.environ)
@@ -108,6 +140,7 @@ def main() -> None:
 
     lines: dict[str, dict[int, set[int]]] = {}
     opens: dict[str, set[int]] = {}
+    attrs: dict[str, set[int]] = {}
     failed_baseline: list[str] = []
     facts = {"cmp": {}, "vals": {}, "truth": {}}  # site -> {facts json: set(gi)}
     incomplete: list[int] = []
@@ -137,6 +170,8 @@ def main() -> None:
                 per.setdefault(ln, set()).update(chunk_gis)
         for p in res["opens"].get("", []):
             opens.setdefault(p, set()).update(chunk_gis)
+        for a in res.get("attrs", []):
+            attrs.setdefault(a, set()).update(chunk_gis)
         if res.get("incomplete_children"):
             incomplete += chunk_gis
         for tid in groups[ci]["tests"]:
@@ -152,6 +187,8 @@ def main() -> None:
                     per.setdefault(ln, set()).add(gi)
             for p in rec["opens"]:
                 opens.setdefault(p, set()).add(gi)
+            for a in rec.get("attrs", []):
+                attrs.setdefault(a, set()).add(gi)
             acc = {"cmp": {}, "vals": {}, "truth": {}}
             add_facts([gi], *rec["own"], acc)
             for c in rec["pool"]:
@@ -174,6 +211,8 @@ def main() -> None:
         "sets": None,
         "lines": {f: {str(k): intern(v) for k, v in per.items()} for f, per in lines.items()},
         "opens": {p: intern(v) for p, v in opens.items()},
+        "attrs": {a: intern(v) for a, v in attrs.items()},
+        "attr_names": attr_names,
         "failed_baseline": failed_baseline,
         "sites": sites,
         "cmp": pack("cmp"),
@@ -189,7 +228,7 @@ def main() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"map: {len(order)} tests in {len(groups)} chunks, {len(lines)} files, "
           f"{len(opens)} data files, {len(out['cmp'])} cmp sites, {len(out['truth'])} bool sites, "
-          f"{len(sets)} test sets, incomplete groups {out['incomplete']}, "
+          f"{len(sets)} test sets, {len(attrs)} attrs read ({len(attr_names)} recorded names), incomplete groups {out['incomplete']}, "
           f"baseline failures {failed_baseline}", file=sys.stderr)
 
 

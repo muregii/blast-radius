@@ -35,6 +35,11 @@ REPO = Path(os.environ.get("RTS_REPO", "/repo"))
 MAP = Path(os.environ.get("RTS_MAP", "/app/map.json"))
 APP = Path(__file__).resolve().parent
 TMP = Path(os.environ.get("RTS_TMP", "/tmp"))
+STATE = MAP.with_suffix(".state.json")
+IMPORTSTATE = APP / "buildtools" / "importstate.py"
+# Only try the class-attribute path when the line-based selection costs more
+# than this (it spends ~1.5 s of CPU importing all of sqlglot).
+CLASS_ATTR_MIN_MS = int(os.environ.get("RTS_CLASS_ATTR_MIN_MS", "5000"))
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -247,6 +252,8 @@ class PyIndex:
 class Selector:
     def __init__(self):
         raw = json.loads(MAP.read_text())
+        self._gt_cache: dict = {}
+        sets = raw.get("sets")
         if raw.get("failed_baseline"):
             log(f"warning: map baseline failures {raw['failed_baseline']}")
         self.groups: list[list[str]] = raw["groups"]
@@ -263,11 +270,28 @@ class Selector:
         self.by_id = {t["id"]: t for t in self.tests}
         self.ms = {t["number"]: round(t["seconds"] * 1000) for t in self.tests}
         self.prover = Prover(raw)
+        self.attr_names = set(raw.get("attr_names", ()))
+        self.attr_tests = {}
+        for a, sid in raw.get("attrs", {}).items():
+            self.attr_tests[a] = self.group_tests_cached(sets[sid]) if sets is not None else set()
+        self._state = None
+        self._test_texts: dict[str, str] = {}
+        self._helpers = None
         self.silent_log: list[str] = []
+        self.tests_by_file: dict[str, set[int]] = {}
+        for t in self.tests:
+            self.tests_by_file.setdefault(t["file"], set()).add(t["number"])
         mapped = {i for g in self.groups for i in g}
         # Tests the map does not know about are always selected.
         self.unmapped = {t["number"] for t in self.tests if t["id"] not in mapped}
         self.all = {t["number"] for t in self.tests}
+
+    def group_tests_cached(self, gis) -> set[int]:
+        key = id(gis)
+        hit = self._gt_cache.get(key)
+        if hit is None:
+            hit = self._gt_cache[key] = self.group_tests(gis)
+        return hit
 
     def group_tests(self, gis) -> set[int]:
         out = set()
@@ -299,6 +323,7 @@ class Selector:
         cands: set[int] = set()
         new_texts: dict[str, str] = {}
         reasons = []
+        class_edits: list[tuple[str, set[int], str]] = []
         for fp in files:
             if fp.old is None or fp.new is None or fp.old != fp.new:
                 return set(self.all), {}, f"add/delete/rename {fp.old}->{fp.new}"
@@ -312,13 +337,103 @@ class Selector:
             new_texts[path] = new_text
             if path.endswith(".py"):
                 c, why = self._python_change(path, old_text, fp)
+                if (c and path.startswith("sqlglot/") and split_cost(c, self.ms) > CLASS_ATTR_MIN_MS
+                        and class_body_data_edit(old_text, new_text)):
+                    class_edits.append((path, c, why))
+                    continue
             elif path in self.opens or path.startswith("tests/fixtures/"):
                 c, why = self.group_tests(self.opens.get(path, [])), "data file"
             else:
                 c, why = set(self.all), "unknown file kind"
             reasons.append(f"{path}: {why} -> {len(c)}")
             cands |= c
+        if class_edits:
+            # Edits that only change data assigned in class bodies: what they
+            # can change is import-time state. Compare it with the pinned
+            # commit's and select the tests that read a changed attribute.
+            alt, why2 = self.class_attr_tests(new_texts)
+            for path, c, why in class_edits:
+                if alt is not None and split_cost(alt, self.ms) < split_cost(c, self.ms):
+                    c, why = alt, why2
+                else:
+                    why = f"{why}; class attrs: {why2}"
+                reasons.append(f"{path}: {why} -> {len(c)}")
+                cands |= c
         return cands, new_texts, "; ".join(reasons)
+
+    def class_attr_tests(self, new_texts: dict[str, str]) -> tuple[set[int] | None, str]:
+        """Tests that read a class attribute whose import-time value the patch
+        changes, or None if that cannot be told."""
+        if not self.attr_names or not STATE.exists():
+            return None, "no attribute map"
+        try:
+            base = self._base_state()
+            root = mirror_tree(TMP / "st", new_texts)
+            out = TMP / "rts_state.json"
+            if out.exists():
+                out.unlink()
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RTS_")}
+            env.update(PYTHONHASHSEED="0", PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1")
+            subprocess.run([sys.executable, str(IMPORTSTATE), str(out), str(root)], env=env,
+                           cwd=str(TMP), capture_output=True, timeout=60, check=True)
+            new = json.loads(out.read_text())
+        except Exception as e:  # never let this cost safety
+            return None, f"state error {type(e).__name__}"
+        if new.get("import_failed") != base.get("import_failed"):
+            return None, "import changed"
+        a, b = base["state"], new["state"]
+        changed = [k for k in set(a) | set(b) if a.get(k) != b.get(k)
+                   and not k.endswith(("|__path__", "|__file__", "|__cached__"))]
+        if not changed:
+            return set(), "import state unchanged"
+        tests: set[int] = set()
+        for k in changed:
+            if not k.startswith("C:") or k not in a or k not in b:
+                return None, f"changed {k.split('|')[-1]} ({'module global' if k.startswith('M:') else 'added/removed'})"
+            owner, name = k[2:].split("|", 1)
+            if name not in self.attr_names:
+                return None, f"changed {name} (reads not recorded)"
+            if b[k].startswith("enum") or a[k].startswith("enum"):
+                return None, f"changed {name} (enum)"
+            tests |= self.attr_tests.get(f"{owner}|{name}", set())
+            tests |= self.tests_naming(name)
+        return tests | self.unmapped, f"{len(changed)} class attrs changed"
+
+    def _base_state(self) -> dict:
+        if self._state is None:
+            self._state = json.loads(STATE.read_text())
+        return self._state
+
+    def tests_naming(self, name: str) -> set[int]:
+        """Tests in test files that mention the attribute by name."""
+        out = set()
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        for f, nums in self.tests_by_file.items():
+            text = self._test_texts.get(f)
+            if text is None:
+                try:
+                    text = (REPO / f).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                # helpers imported by test files can read attributes too
+                self._test_texts[f] = text
+            if pat.search(text):
+                out |= nums
+        if pat.search(self._helpers_text()):
+            out |= set(self.all)
+        return out
+
+    def _helpers_text(self) -> str:
+        if self._helpers is None:
+            parts = []
+            for p in (REPO / "tests").rglob("*.py"):
+                if not p.name.startswith("test_"):
+                    try:
+                        parts.append(p.read_text(encoding="utf-8", errors="replace"))
+                    except OSError:
+                        pass
+            self._helpers = "\n".join(parts)
+        return self._helpers
 
     def _python_change(self, path: str, old_text: str, fp: FilePatch) -> tuple[set[int], str]:
         under_src = path.startswith("sqlglot/")
@@ -387,6 +502,79 @@ class Selector:
                 self.silent_log.append(f"{path}: {why}")
             all_gis |= gis
         return self.group_tests(all_gis), "; ".join(notes) or "lines"
+
+
+def class_body_data_edit(old_text: str, new_text: str) -> bool:
+    """True if the two modules differ only in simple assignments made directly
+    in class bodies (`NAME = value`, `NAME: T = value`), at any class nesting,
+    never inside a function."""
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+    return _bodies_ok(old.body, new.body, in_class=False)
+
+
+def _plain_assign(s: ast.stmt) -> bool:
+    if isinstance(s, ast.Assign):
+        targets = s.targets
+    elif isinstance(s, ast.AnnAssign) and s.value is not None and s.simple:
+        targets = [s.target]
+    else:
+        return False
+    return all(isinstance(t, ast.Name) and not t.id.startswith("__") for t in targets)
+
+
+def _bodies_ok(old: list, new: list, in_class: bool) -> bool:
+    import difflib
+
+    a = [ast.dump(x) for x in old]
+    b = [ast.dump(x) for x in new]
+    if a == b:
+        return True
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        os_, ns = old[i1:i2], new[j1:j2]
+        if (tag == "replace" and len(os_) == len(ns)
+                and all(isinstance(x, ast.ClassDef) and isinstance(y, ast.ClassDef) for x, y in zip(os_, ns))):
+            for x, y in zip(os_, ns):
+                same_head = (x.name == y.name
+                             and [ast.dump(d) for d in x.decorator_list] == [ast.dump(d) for d in y.decorator_list]
+                             and [ast.dump(d) for d in x.bases] == [ast.dump(d) for d in y.bases]
+                             and [ast.dump(d) for d in x.keywords] == [ast.dump(d) for d in y.keywords])
+                if not same_head or not _bodies_ok(x.body, y.body, in_class=True):
+                    return False
+            continue
+        if not in_class or not all(_plain_assign(x) for x in os_ + ns):
+            return False
+    return True
+
+
+def mirror_tree(root: Path, new_texts: dict[str, str]) -> Path:
+    """root/sqlglot: symlinks to the pinned sqlglot with the patched modules as
+    real files."""
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    changed = {Path(p): t for p, t in new_texts.items() if p.startswith("sqlglot/")}
+    on_path = {Path(*p.parts[:i]) for p in changed for i in range(1, len(p.parts))}
+
+    def fill(rel: Path):
+        (root / rel).mkdir()
+        for entry in os.scandir(REPO / rel):
+            r = rel / entry.name
+            if r in changed:
+                continue
+            if r in on_path:
+                fill(r)
+            else:
+                (root / r).symlink_to(REPO / r)
+
+    fill(Path("sqlglot"))
+    for r, text in changed.items():
+        (root / r).write_text(text, encoding="utf-8")
+    return root
 
 
 # ----------------------------------------------------------- verification --

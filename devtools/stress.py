@@ -120,6 +120,14 @@ def main():
             ids = keep
         ws.prepare(new_texts)
         failed, info = S.run_tests(ws.root, ids, timeout=600)
+        if failed:
+            # Some tests depend on run order (they fail on clean code too when
+            # run after certain others). Only failures the clean code does not
+            # reproduce in the same order count.
+            ws.prepare({})
+            clean, _ = S.run_tests(ws.root, ids, timeout=600)
+            if clean:
+                failed = set(failed) - set(clean)
         status = "OK"
         if failed is None:
             status = f"UNUSABLE {info}"
