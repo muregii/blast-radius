@@ -1,7 +1,8 @@
 """Soundness stress test for the class-attribute path.
 
 Mutates one literal inside a class-body assignment of sqlglot (flips a bool,
-bumps an int, changes a string, drops a dict/set/tuple element), asks the
+bumps an int, changes a string) or inserts a changed copy of one element line
+of a multi-line literal (shifting every later line), asks the
 selector which tests that edit can reach, and runs tests the line-based rule
 would have selected but the class-attribute rule dropped. Any failure among
 those is a soundness bug.
@@ -64,6 +65,37 @@ def mutate_value(src_lines, node, rng):
     return ln, line[:c.col_offset] + new + line[c.end_col_offset:]
 
 
+def insert_element(src_lines, node, rng):
+    """Copies one element line of a multi-line literal, changes a constant in
+    the copy and inserts it below: the value changes and later lines shift.
+    Returns (line index, new line, insert=True) or None."""
+    cands = []
+    for n in ast.walk(node.value):
+        elts = n.keys if isinstance(n, ast.Dict) else getattr(n, "elts", None)
+        if not isinstance(n, (ast.List, ast.Tuple, ast.Set, ast.Dict)) or not elts:
+            continue
+        rows = [e for e in elts if e is not None and e.lineno == e.end_lineno]
+        if len({e.lineno for e in elts if e is not None}) < 2:
+            continue
+        for e in rows:
+            line = src_lines[e.lineno - 1]
+            same = [x for x in elts if x is not None and x.lineno == e.lineno]
+            if len(same) == 1 and line.rstrip().endswith(","):
+                cands.append(e)
+    if not cands:
+        return None
+    e = rng.choice(cands)
+    consts = [c for c in ast.walk(e) if isinstance(c, ast.Constant)
+              and c.lineno == c.end_lineno and isinstance(c.value, (int, str))
+              and not isinstance(c.value, bool)]
+    if not consts:
+        return None
+    c = rng.choice(consts)
+    new = repr(c.value + 1) if isinstance(c.value, int) else repr(c.value + "_x")
+    line = src_lines[c.lineno - 1]
+    return c.lineno - 1, line[:c.col_offset] + new + line[c.end_col_offset:], True
+
+
 def main():
     n, seed = int(sys.argv[1]), int(sys.argv[2])
     rng = random.Random(seed)
@@ -84,12 +116,18 @@ def main():
             continue
         node = rng.choice(assigns)
         lines = src.split("\n")
-        m = mutate_value(lines, node, rng)
+        if rng.random() < 0.5:
+            m = insert_element(lines, node, rng)
+        else:
+            m = mutate_value(lines, node, rng)
         if m is None:
             continue
-        ln, new_line = m
+        ln, new_line = m[0], m[1]
         new_lines = list(lines)
-        new_lines[ln] = new_line
+        if len(m) > 2:
+            new_lines.insert(ln + 1, new_line)
+        else:
+            new_lines[ln] = new_line
         mutated = "\n".join(new_lines)
         try:
             ast.parse(mutated)

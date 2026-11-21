@@ -19,7 +19,8 @@ A single miss costs more than the whole leader's total, so **zero misses comes f
 | v1 coverage | 08354ee | 268.2 s, 0 misses | 327.4 s, 0 misses |
 | v2 silent proofs | 4fe3624 | 212.5 s, 0 misses | **317.0 s, 0 misses** (CPU ≈ 2.2 s) |
 | v3 per-test coverage | 0f7a851 | 168.8 s, 0 misses | not submitted (c2 superseded it) |
-| c2 class-attribute reads | see RESULTS.md | 127.7 s, 0 misses | see RESULTS.md |
+| c2 class-attribute reads | 55118fa | 127.7 s, 0 misses | **252.5 s, 0 misses** (CPU 7.3 s) |
+| c3 test edits, inert files | see RESULTS.md | 127.7 s, 0 misses | see RESULTS.md |
 
 Every submission and what it taught is logged in RESULTS.md.
 
@@ -55,6 +56,17 @@ Decision time (`selector.py`, `silent.py`), per patch:
   the edited comparison / and-or gives the same value old vs new, the group's
   process ran identically → drop the group. Handles operator swaps, literal
   operand changes, and/or swaps in boolean context. Inconclusive → keep.
+- Test module edits: importers first (33 dialect test files import
+  `Validator` from `tests/dialects/test_dialect.py`): an edit selects the
+  file plus every test file importing it, transitively. If nothing imports
+  it, `test_edit_targets` narrows to the edited `test_*` methods (in the
+  class and its in-file subclasses), or the classes whose helpers /
+  class-level code changed; module-level edits → whole file.
+- Files no test can reach (`inert_file`): outside sqlglot/, tests/,
+  sqlglotc/; not a pytest/packaging startup file; never opened during the
+  build; never named in tests/ → nothing. (Docs, posts, .github, benchmarks,
+  pdoc.) Checked by blanking all 36 such files: full suite still passes.
+- A changed PEP 263 `coding:` line → everything that imports the file.
 - Anything unanalysable → all tests.
 - Split: LPT over k=1..8 workers, choose min(busiest + 2 s·k).
 - Running candidates to check them exists (`run_tests`, `Workspace`) but the
@@ -96,6 +108,11 @@ Per-test coverage (v3) fixed fixture edits (151 → 1 test). What remains:
    then `python3 score.py sample sample/answers.json output.jsonl`.
 5. Soundness of the prover: `devtools/stress.py <n> <seed>` generates operator
    mutants, runs every test the prover claims silent; must print `bugs: 0`.
+   Likewise `devtools/stress_attrs.py` (class-body data edits) and
+   `devtools/stress_tests.py` (test module edits).
+   Build time and the real image: push to a `gate/*` branch; the GitHub
+   Actions `gate` workflow builds on 4-core amd64 (c2: 327 s; v2 339 s, which
+   passed the scorer) and runs the sample under the scorer's run flags.
 6. Docker on this Mac: `make sample` runs under amd64 emulation and is very
    slow. For a correctness check build natively:
    `sed 's/@sha256:[a-f0-9]*//' Dockerfile > Dockerfile.native` and use the

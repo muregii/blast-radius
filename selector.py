@@ -18,6 +18,7 @@ Logs go to stderr; stdout carries only answer lines.
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import os
 import re
@@ -189,6 +190,18 @@ def hunk_regions(start: int, body: list[str]) -> tuple[set[int], set[int]]:
 
 # -------------------------------------------------------------- analysis --
 
+_CODING = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+def coding_decl(text: str):
+    """The PEP 263 encoding declaration of a source file, if any."""
+    for line in text.encode("utf-8", "surrogateescape").splitlines()[:2]:
+        m = _CODING.match(line)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
 def ast_equal(a: str, b: str) -> bool:
     try:
         return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
@@ -277,6 +290,8 @@ class Selector:
         self._state = None
         self._test_texts: dict[str, str] = {}
         self._helpers = None
+        self._test_blob = None
+        self._test_imports = None
         self.silent_log: list[str] = []
         self.tests_by_file: dict[str, set[int]] = {}
         for t in self.tests:
@@ -315,6 +330,82 @@ class Selector:
             gis.update(v)
         return gis
 
+    # Files pytest or packaging read on their own, before any test runs.
+    STARTUP_FILES = {"pyproject.toml", "setup.cfg", "setup.py", "tox.ini", "pytest.ini",
+                     "conftest.py", "sitecustomize.py", "usercustomize.py", "MANIFEST.in",
+                     "requirements.txt", ".gitmodules"}
+
+    def test_importers(self, path: str) -> set[str]:
+        """Test modules that import `path` (another test module), directly or
+        through other test modules."""
+        if self._test_imports is None:
+            graph: dict[str, set[str]] = {}
+            for f in REPO.joinpath("tests").rglob("*.py"):
+                rel = str(f.relative_to(REPO))
+                try:
+                    tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"))
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    mods = []
+                    if isinstance(node, ast.ImportFrom):
+                        if node.level:
+                            base = Path(rel).parent
+                            for _ in range(node.level - 1):
+                                base = base.parent
+                            parts = str(base).split("/") + (node.module.split(".") if node.module else [])
+                            mods.append(".".join(parts))
+                            mods += [".".join(parts + [a.name]) for a in node.names]
+                        elif node.module:
+                            mods.append(node.module)
+                            mods += [f"{node.module}.{a.name}" for a in node.names]
+                    elif isinstance(node, ast.Import):
+                        mods += [a.name for a in node.names]
+                    for m in mods:
+                        if m == "tests" or m.startswith("tests."):
+                            for cand in (m.replace(".", "/") + ".py", m.replace(".", "/") + "/__init__.py"):
+                                graph.setdefault(cand, set()).add(rel)
+            self._test_imports = graph
+        out, todo = set(), [path]
+        while todo:
+            cur = todo.pop()
+            for imp in self._test_imports.get(cur, ()):
+                if imp not in out and imp != path:
+                    out.add(imp)
+                    todo.append(imp)
+        return out
+
+    def inert_file(self, path: str) -> bool:
+        """A changed file that cannot change any test's outcome: outside the
+        package, the tests and sqlglotc; not read by pytest or packaging at
+        startup; never opened by any test during the build; and never named
+        by a test file. (Docs, posts, CI config, benchmarks.)"""
+        top = path.split("/", 1)[0]
+        name = path.rsplit("/", 1)[-1]
+        if top in ("sqlglot", "tests", "sqlglotc") or "/" not in path and top.endswith(".py"):
+            return False
+        if name in self.STARTUP_FILES or name.endswith((".pth", ".so", ".pyd")):
+            return False
+        if path in self.opens:
+            return False
+        # A test can reach a module here only through its directory (an
+        # import or sys.path entry); a data file, also through its name.
+        stem = name.split(".")[0] if not name.endswith(".py") else top
+        words = {w for w in (path, name, top, stem) if len(w) >= 3}
+        text = self._all_test_text()
+        return not any(re.search(r"(?<![\w.])" + re.escape(w) + r"(?![\w])", text) for w in words)
+
+    def _all_test_text(self) -> str:
+        if self._test_blob is None:
+            parts = []
+            for f in sorted(REPO.joinpath("tests").rglob("*.py")):
+                try:
+                    parts.append(f.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+            self._test_blob = "\n".join(parts)
+        return self._test_blob
+
     def candidates(self, patch_text: str) -> tuple[set[int], dict[str, str], str]:
         """Returns (candidate test numbers, {path: new text}, reason)."""
         files = parse_patch(patch_text)
@@ -335,7 +426,9 @@ class Selector:
             except (OSError, ValueError, UnicodeDecodeError) as e:
                 return set(self.all), {}, f"cannot apply {path}: {e}"
             new_texts[path] = new_text
-            if path.endswith(".py"):
+            if self.inert_file(path):
+                c, why = set(), "file no test can reach"
+            elif path.endswith(".py"):
                 c, why = self._python_change(path, old_text, fp)
                 if (c and path.startswith("sqlglot/") and split_cost(c, self.ms) > CLASS_ATTR_MIN_MS
                         and class_body_data_edit(old_text, new_text)):
@@ -383,7 +476,9 @@ class Selector:
             return None, "import changed"
         a, b = base["state"], new["state"]
         changed = [k for k in set(a) | set(b) if a.get(k) != b.get(k)
-                   and not k.endswith(("|__path__", "|__file__", "|__cached__"))]
+                   # __firstlineno__ only moves when lines shift; only
+                   # inspect.getsource reads it, and nothing here calls that.
+                   and not k.endswith(("|__path__", "|__file__", "|__cached__", "|__firstlineno__"))]
         if not changed:
             return set(), "import state unchanged"
         tests: set[int] = set()
@@ -445,6 +540,12 @@ class Selector:
         except SyntaxError:
             return set(self.all), "old file unparsable"
         new_full = apply_hunks(old_text, fp.hunks)
+        if coding_decl(old_text) != coding_decl(new_full):
+            # A comment that changes how the file is decoded can stop it from
+            # importing at all.
+            if under_src:
+                return self.group_tests(self.groups_for_file(path)), "encoding declaration changed"
+            return set(self.all), "test encoding declaration changed"
         if ast_equal(old_text, new_full):
             return set(), "ast unchanged"
         try:
@@ -458,6 +559,24 @@ class Selector:
             mod = path
             if path.endswith(("helpers.py", "__init__.py", "conftest.py")) or "/" in path[len("tests/"):] and not os.path.basename(path).startswith("test_"):
                 return set(self.all), "shared test helper"
+            importers = self.test_importers(path)
+            if importers:
+                # Other test modules import this one (e.g. dialect tests import
+                # Validator from test_dialect.py): their tests run its code too.
+                files = importers | {path}
+                return ({t["number"] for t in self.tests if t["file"] in files},
+                        f"test file + {len(importers)} importing test files")
+            targeted = test_edit_targets(old_text, new_full)
+            if targeted is not None:
+                classes, methods = targeted
+                out = set()
+                for t in self.tests:
+                    if t["file"] != mod:
+                        continue
+                    _, cls, meth = t["id"].split("::")
+                    if cls in classes or (cls, meth) in methods:
+                        out.add(t["number"])
+                return out, f"test methods/classes edited: {len(methods)} methods, {len(classes)} classes"
             return {t["number"] for t in self.tests if t["file"] == mod}, "test file"
 
         all_gis: set[int] = set()
@@ -502,6 +621,80 @@ class Selector:
                 self.silent_log.append(f"{path}: {why}")
             all_gis |= gis
         return self.group_tests(all_gis), "; ".join(notes) or "lines"
+
+
+def _stmt_dumps(body):
+    return [ast.dump(x) for x in body]
+
+
+def test_edit_targets(old_text: str, new_text: str):
+    """For an edit to a test module that no other module imports: the test
+    classes whose every test is affected, and the (class, method) pairs
+    affected, or None if the edit reaches the whole module.
+
+    Changed code inside `test_*` method M of class C affects M in C and in
+    every subclass of C in the module; changed code anywhere else in C (other
+    methods, class-level statements) affects every test of C and of its
+    subclasses; anything at module level affects every test."""
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    a, b = _stmt_dumps(old.body), _stmt_dumps(new.body)
+    changed_classes: set[str] = set()
+    methods: set[tuple[str, str]] = set()
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if op != "replace" or i2 - i1 != j2 - j1:
+            return None
+        for o, n in zip(old.body[i1:i2], new.body[j1:j2]):
+            if not (isinstance(o, ast.ClassDef) and isinstance(n, ast.ClassDef) and o.name == n.name
+                    and _stmt_dumps(o.bases) == _stmt_dumps(n.bases)
+                    and _stmt_dumps(o.keywords) == _stmt_dumps(n.keywords)
+                    and _stmt_dumps(o.decorator_list) == _stmt_dumps(n.decorator_list)):
+                return None
+            ob, nb = _stmt_dumps(o.body), _stmt_dumps(n.body)
+            for op2, k1, k2, l1, l2 in difflib.SequenceMatcher(None, ob, nb, autojunk=False).get_opcodes():
+                if op2 == "equal":
+                    continue
+                stmts = o.body[k1:k2] + n.body[l1:l2]
+                fns = [x for x in stmts if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                if len(fns) != len(stmts) or not all(x.name.startswith("test") for x in fns):
+                    changed_classes.add(o.name)
+                elif any(re.search(r"\.\s*" + re.escape(x.name) + r"\b", t)
+                         for x in fns for t in (old_text, new_text)):
+                    # Called or referenced as an attribute somewhere: treat as
+                    # a helper.
+                    changed_classes.add(o.name)
+                else:
+                    methods |= {(o.name, x.name) for x in fns}
+    # Subclasses within the module inherit both kinds of change.
+    bases: dict[str, set[str]] = {}
+    for tree in (old, new):
+        for x in tree.body:
+            if isinstance(x, ast.ClassDef):
+                bases.setdefault(x.name, set()).update(
+                    y.id if isinstance(y, ast.Name) else y.attr if isinstance(y, ast.Attribute) else ""
+                    for y in x.bases)
+
+    def descendants(c):
+        out, todo = {c}, [c]
+        while todo:
+            cur = todo.pop()
+            for k, v in bases.items():
+                if cur in v and k not in out:
+                    out.add(k)
+                    todo.append(k)
+        return out
+
+    classes = set()
+    for c in changed_classes:
+        classes |= descendants(c)
+    meths = set()
+    for c, m in methods:
+        meths |= {(d, m) for d in descendants(c)}
+    return classes, meths
 
 
 def class_body_data_edit(old_text: str, new_text: str) -> bool:
