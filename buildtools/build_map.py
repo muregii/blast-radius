@@ -21,7 +21,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-HEAVY_SECONDS = 0.3
+CHUNK_SECONDS = 6.0
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -35,16 +35,28 @@ def main() -> None:
     for t in tests:
         by_file.setdefault(t["file"], []).append(t)
 
-    groups: list[dict] = []  # {"tests": [numbers], "args": [...]}
+    # Every test is its own selection unit: each one runs in a forked child
+    # of a process that has collected (imported) its chunk, so what it
+    # touches is recorded from the same post-collection state, without
+    # caches warmed by the tests before it. A chunk is a slice of one test
+    # file; lines run during collection count for every test of the chunk.
+    chunks: list[list[dict]] = []
     for file, ts in sorted(by_file.items()):
-        light = [t for t in ts if t["seconds"] < HEAVY_SECONDS]
-        heavy = [t for t in ts if t["seconds"] >= HEAVY_SECONDS]
-        if light:
-            # Exact node ids: --deselect matches by prefix and would drop
-            # test_foo__bar along with test_foo.
-            groups.append({"tests": [t["id"] for t in light], "args": [t["id"] for t in light]})
-        for t in heavy:
-            groups.append({"tests": [t["id"]], "args": [t["id"]]})
+        cur: list[dict] = []
+        acc = 0.0
+        for t in ts:
+            if cur and acc + t["seconds"] > CHUNK_SECONDS:
+                chunks.append(cur)
+                cur, acc = [], 0.0
+            cur.append(t)
+            acc += t["seconds"]
+        if cur:
+            chunks.append(cur)
+    # Longest chunks first so the pool finishes evenly.
+    chunks.sort(key=lambda c: -sum(t["seconds"] + 0.05 for t in c))
+    order = [t["id"] for c in chunks for t in c]
+    gi_of = {tid: i for i, tid in enumerate(order)}
+    groups = [{"tests": [t["id"] for t in c], "args": [t["id"] for t in c]} for c in chunks]
 
     tmp = tempfile.mkdtemp(prefix="rtsmap")
     instr = os.path.join(tmp, "instr")
@@ -55,6 +67,7 @@ def main() -> None:
     env.update(
         SKIP_INTEGRATION="0",
         RTS_RECORD="1",
+        RTS_FORK="1",
         RTS_ROOT=run_root,
         PYTHONPATH=os.pathsep.join([run_root, HERE]),
         PYTHONDONTWRITEBYTECODE="1",
@@ -81,57 +94,103 @@ def main() -> None:
     with ThreadPoolExecutor(jobs) as pool:
         results = list(pool.map(run, range(len(groups))))
 
-    lines: dict[str, dict[int, list[int]]] = {}
-    opens: dict[str, list[int]] = {}
+    # Interned test sets keep the map small: most lines share their set.
+    set_ids: dict[tuple, int] = {}
+    sets: list[list[int]] = []
+
+    def intern(gis) -> int:
+        key = tuple(sorted(gis))
+        i = set_ids.get(key)
+        if i is None:
+            i = set_ids[key] = len(sets)
+            sets.append(list(key))
+        return i
+
+    lines: dict[str, dict[int, set[int]]] = {}
+    opens: dict[str, set[int]] = {}
     failed_baseline: list[str] = []
-    cmp: dict[str, dict[str, list]] = {}
-    vals: dict[str, dict[str, object]] = {}
-    truth: dict[str, dict[str, list]] = {}
+    facts = {"cmp": {}, "vals": {}, "truth": {}}  # site -> {facts json: set(gi)}
     incomplete: list[int] = []
-    for gi, res in enumerate(results):
-        if res.get("incomplete_children"):
-            incomplete.append(gi)
-        for k, v in res.get("cmp", {}).items():
-            cmp.setdefault(k, {})[str(gi)] = v
-        for k, v in res.get("vals", {}).items():
-            vals.setdefault(k, {})[str(gi)] = v
-        for k, v in res.get("truth", {}).items():
-            truth.setdefault(k, {})[str(gi)] = v
-        seen: dict[str, set[int]] = {}
-        for files in res["lines"].values():
-            for f, ls in files.items():
-                seen.setdefault(f, set()).update(ls)
-        for f, ls in seen.items():
+
+    def add_facts(gis, cmp_, vals_, truth_, acc):
+        for kind, d in (("cmp", cmp_), ("vals", vals_), ("truth", truth_)):
+            for k, v in d.items():
+                if kind == "vals":
+                    if v == "overflow":
+                        acc[kind].setdefault(k, "overflow")
+                        acc[kind][k] = "overflow"
+                        continue
+                    if acc[kind].get(k) == "overflow":
+                        continue
+                    cur = acc[kind].setdefault(k, set())
+                    cur.update(json.dumps(x) for x in v)
+                else:
+                    acc[kind].setdefault(k, set()).update(json.dumps(x) for x in v)
+
+    for ci, res in enumerate(results):
+        chunk_gis = [gi_of[t] for t in groups[ci]["tests"]]
+        failed_baseline += [n for n, o in res["outcomes"].items() if o == "failed"]
+        # Collection-time lines and opens: every test of the chunk.
+        for f, ls in res["lines"].get("", {}).items():
             per = lines.setdefault(f, {})
             for ln in ls:
-                per.setdefault(ln, []).append(gi)
-        for paths in res["opens"].values():
-            for p in paths:
-                lst = opens.setdefault(p, [])
-                if not lst or lst[-1] != gi:
-                    lst.append(gi)
-        failed_baseline += [n for n, o in res["outcomes"].items() if o == "failed"]
+                per.setdefault(ln, set()).update(chunk_gis)
+        for p in res["opens"].get("", []):
+            opens.setdefault(p, set()).update(chunk_gis)
+        if res.get("incomplete_children"):
+            incomplete += chunk_gis
+        for tid in groups[ci]["tests"]:
+            gi = gi_of[tid]
+            rec = res["per_test"].get(tid)
+            if rec is None or rec.get("lost") or rec.get("incomplete"):
+                incomplete.append(gi)
+                if rec is None or rec.get("lost"):
+                    continue
+            for f, ls in rec["lines"].items():
+                per = lines.setdefault(f, {})
+                for ln in ls:
+                    per.setdefault(ln, set()).add(gi)
+            for p in rec["opens"]:
+                opens.setdefault(p, set()).add(gi)
+            acc = {"cmp": {}, "vals": {}, "truth": {}}
+            add_facts([gi], *rec["own"], acc)
+            for c in rec["pool"]:
+                add_facts([gi], *c, acc)
+            for kind, d in acc.items():
+                for k, v in d.items():
+                    key = v if v == "overflow" else json.dumps(sorted(v))
+                    facts[kind].setdefault(k, {}).setdefault(key, set()).add(gi)
 
+    def pack(kind):
+        out = {}
+        for k, by in facts[kind].items():
+            out[k] = [[v if v == "overflow" else [json.loads(x) for x in json.loads(v)], intern(g)]
+                      for v, g in by.items()]
+        return out
 
     out = {
-        "groups": [g["tests"] for g in groups],
-        "lines": {f: {str(k): v for k, v in per.items()} for f, per in lines.items()},
-        "opens": opens,
+        "format": 3,
+        "groups": [[tid] for tid in order],
+        "sets": None,
+        "lines": {f: {str(k): intern(v) for k, v in per.items()} for f, per in lines.items()},
+        "opens": {p: intern(v) for p, v in opens.items()},
         "failed_baseline": failed_baseline,
         "sites": sites,
-        "cmp": cmp,
-        "vals": vals,
-        "truth": truth,
-        "incomplete": incomplete,
+        "cmp": pack("cmp"),
+        "vals": pack("vals"),
+        "truth": pack("truth"),
+        "incomplete": sorted(set(incomplete)),
     }
+    out["sets"] = sets
     with open(out_path, "w") as f:
         json.dump(out, f, separators=(",", ":"))
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"map: {len(groups)} groups, {len(lines)} files, "
-          f"{len(opens)} data files, {len(cmp)} cmp sites, {len(truth)} bool sites, "
-          f"incomplete groups {incomplete}, baseline failures {failed_baseline}", file=sys.stderr)
+    print(f"map: {len(order)} tests in {len(groups)} chunks, {len(lines)} files, "
+          f"{len(opens)} data files, {len(out['cmp'])} cmp sites, {len(out['truth'])} bool sites, "
+          f"{len(sets)} test sets, incomplete groups {out['incomplete']}, "
+          f"baseline failures {failed_baseline}", file=sys.stderr)
 
 
 if __name__ == "__main__":

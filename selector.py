@@ -250,8 +250,14 @@ class Selector:
         if raw.get("failed_baseline"):
             log(f"warning: map baseline failures {raw['failed_baseline']}")
         self.groups: list[list[str]] = raw["groups"]
-        self.lines: dict[str, dict[str, list[int]]] = raw["lines"]
-        self.opens: dict[str, list[int]] = raw["opens"]
+        # Format 3 interns test sets: lines/opens hold an index into "sets".
+        sets = raw.get("sets")
+        if sets is not None:
+            self.lines = {f: {k: sets[v] for k, v in per.items()} for f, per in raw["lines"].items()}
+            self.opens = {p: sets[v] for p, v in raw["opens"].items()}
+        else:
+            self.lines = raw["lines"]
+            self.opens = raw["opens"]
         doc = json.loads((DATA / "tests.json").read_text())
         self.tests = doc["tests"]
         self.by_id = {t["id"]: t for t in self.tests}

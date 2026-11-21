@@ -144,12 +144,37 @@ def in_boolean_context(tree, path) -> bool:
     return False
 
 
+class _Unpack:
+    """site -> {str(group): facts}. Format 3 stores each site as
+    [[facts, set id], ...]; expanded on first use."""
+
+    def __init__(self, raw: dict, sets):
+        self.raw = raw
+        self.sets = sets
+        self.cache: dict = {}
+
+    def get(self, site, default=None):
+        if site in self.cache:
+            return self.cache[site]
+        v = self.raw.get(site)
+        if v is None:
+            return default
+        if self.sets is not None:
+            d = {}
+            for facts, sid in v:
+                for g in self.sets[sid]:
+                    d[str(g)] = facts
+            v = d
+        self.cache[site] = v
+        return v
+
+
 class Prover:
     def __init__(self, raw_map: dict):
         self.site_index = {k: i for i, k in enumerate(raw_map.get("sites", []))}
-        self.cmp = raw_map.get("cmp", {})
-        self.vals = raw_map.get("vals", {})
-        self.truth = raw_map.get("truth", {})
+        self.cmp = _Unpack(raw_map.get("cmp", {}), raw_map.get("sets"))
+        self.vals = _Unpack(raw_map.get("vals", {}), raw_map.get("sets"))
+        self.truth = _Unpack(raw_map.get("truth", {}), raw_map.get("sets"))
         self.incomplete = {str(g) for g in raw_map.get("incomplete", [])}
 
     def prove(self, rel, old_tree, new_tree, groups: set[int]) -> tuple[set[int], str]:

@@ -128,7 +128,9 @@ if os.environ.get("RTS_RECORD") == "1":
         tb = type(b)
         if ta in _FAST and tb in _FAST:
             # Facts for a scalar pair never change: record each pair once.
-            key = (site, ta, a, tb, b)
+            # Identity is part of the facts: two equal strings or ints may or
+            # may not be the same object, so it must be part of the key.
+            key = (site, ta, a, tb, b, a is b)
             if key in _seen_pairs:
                 return result
             _seen_pairs.add(key)

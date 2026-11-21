@@ -1,1 +1,4 @@
 output.jsonl
+Dockerfile.native
+Claude outputs/
+.commits_tmp.tgz
