@@ -33,6 +33,29 @@ SWAPS = {"<": "<=", "<=": "<", ">": ">=", ">=": ">", "is": "==", "is not": "!=",
 OPTEXT = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==",
           ast.NotEq: "!=", ast.Is: "is", ast.IsNot: "is not"}
 BUDGET_SECONDS = float(os.environ.get("STRESS_BUDGET", "40"))
+# STRESS_KIND=literal changes a literal operand of a comparison instead of
+# swapping the operator (the prover's literal-change rule).
+LITERAL = os.environ.get("STRESS_KIND") == "literal"
+
+
+def make_literal_mutant(src: str, node, rng) -> str | None:
+    if len(node.comparators) != 1:
+        return None
+    lits = [x for x in (node.left, node.comparators[0])
+            if isinstance(x, ast.Constant) and type(x.value) in (int, str)
+            and x.lineno == x.end_lineno]
+    if not lits:
+        return None
+    x = rng.choice(lits)
+    v = x.value
+    if isinstance(v, int):
+        new = repr(rng.choice([v + 1, v - 1, 0 if v else 1]))
+    else:
+        new = repr(rng.choice([v + "x", v.upper() if v != v.upper() else v.lower(), ""]))
+    lines = src.split("\n")
+    ln = x.lineno - 1
+    lines[ln] = lines[ln][:x.col_offset] + new + lines[ln][x.end_col_offset:]
+    return "\n".join(lines)
 
 
 def make_mutant(src: str, kind: str, node) -> str | None:
@@ -85,7 +108,9 @@ def main():
                      == (int(line), int(col), int(eline), int(ecol))), None)
         if node is None or (kind == "c" and type(node.ops[0]) not in OPTEXT):
             continue
-        mutated = make_mutant(src, kind, node)
+        if LITERAL and kind != "c":
+            continue
+        mutated = make_literal_mutant(src, node, rng) if LITERAL else make_mutant(src, kind, node)
         if mutated is None or mutated == src:
             continue
         try:
